@@ -1,0 +1,280 @@
+---
+title: "Supply Chain Dashboard"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    vertical_layout: fill
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+library(flexdashboard)
+library(shiny)
+library(kableExtra)
+library(ggplot2)
+library(plotly)
+
+# Time Series ML
+library(tidymodels)
+library(modeltime)
+library(modeltime.ensemble)
+
+# Timing & Parallel Processing
+library(tictoc)
+library(future)
+library(doFuture)
+
+# Core 
+library(tidyquant)
+library(tidyverse)
+library(timetk)
+library(lubridate)
+library(inventorize)
+
+forecast_ensemble_test_tbl <-  read_rds("models/forecast_ensemble_test_tbl.rds")
+model_ensemble_refit_tbl <-  read_rds("models/ensemble_models.rds")
+data_prepared_tbl <-  read_rds("data/data_prepare_tbl.rds")
+data_prepared_tbl_cleaned  <-  read_rds("data/data_prepared_tbl_cleaned.rds")
+future_tbl <-  read_rds("data/future_tbl.rds")
+
+
+
+horizon <- 365
+date_today <- date("2017-12-30")
+
+forecast_full_tbl <- model_ensemble_refit_tbl %>%
+  modeltime_forecast(
+    new_data = future_tbl %>% slice(1:horizon),
+    actual_data = data_prepared_tbl_cleaned,
+    keep_data = TRUE
+  ) %>%
+  mutate(
+    .value = expm1(.value),
+    sales = expm1(sales),
+    .conf_lo = expm1(.conf_lo),
+    .conf_hi = expm1(.conf_hi)
+  ) %>% 
+  group_by(store, item)
+
+```
+
+Demand Forecasting {data-icon="fa-signal"}
+=============================================================
+
+
+Column {data-width=350}
+-----------------------------------------------------------------------
+
+### Forecasts' RMSE of each item
+```{r}
+rmse_models <- forecast_ensemble_test_tbl %>%
+  filter(.key == "prediction") %>%
+  select(store, item, .value, sales) %>%
+  group_by(item) %>%
+  summarize_accuracy_metrics(
+    truth      = sales, 
+    estimate   = .value,
+    metric_set = metric_set(mae, rmse, rsq)
+  ) %>% 
+  mutate(mae = round(mae, 3),
+         rmse = round(rmse, 3),
+         rsq = round(rsq, 3))
+
+rmse_models %>% 
+  kbl() %>% 
+  kable_paper("hover")
+```
+
+
+### Item 1
+```{r}
+biweekly_demand_by_item <- model_ensemble_refit_tbl %>%
+  modeltime_forecast(
+    new_data = future_tbl %>% slice(1:14),
+    actual_data = data_prepared_tbl_cleaned,
+    keep_data = TRUE
+  ) %>% 
+  filter(.key == "prediction") %>% 
+  select(date, item, .value) %>% 
+  group_by(item) %>% 
+  summarise(total_biweekly_forecasted_sales = round(sum(.value)))
+
+valueBox(biweekly_demand_by_item$total_biweekly_forecasted_sales[[1]], "Forecasted demand of Item 1 for the next 14 days")
+```
+
+### Item 2
+
+```{r}
+valueBox(biweekly_demand_by_item$total_biweekly_forecasted_sales[[2]], "Forecasted demand of Item 2 for the next 14 days")
+
+```
+
+
+### SKUs
+
+```{r}
+valueBox(138, "Total Number of SKUs ordered")
+```
+
+### Available SKUs to full fill customers requirements
+
+```{r}
+valueBox(110, "Available SKUs to full fill customers requirements")
+```
+
+
+### Production Yield (%)
+
+```{r}
+gauge(75, min = 0, max = 100, symbol = '%', gaugeSectors(
+  success = c(80, 100), warning = c(40, 79), danger = c(0, 39)
+))
+```
+
+
+### Production Capacity (%)
+
+```{r}
+gauge(80, min = 0, max = 100, symbol = '%', gaugeSectors(
+  success = c(80, 100), warning = c(40, 79), danger = c(0, 39)
+))
+```
+
+Column {data-width=650, .tabset}
+-----------------------------------------------------------------------
+
+
+### Customer 1
+
+```{r}
+forecast_full_tbl %>%
+  filter(store == 1) %>% 
+  plot_modeltime_forecast(
+  .facet_ncol = 3,
+  .y_intercept = 0
+)
+
+```
+
+
+### Customer 2
+
+```{r}
+forecast_full_tbl %>%
+  filter(store == 2) %>% 
+  plot_modeltime_forecast(
+  .facet_ncol = 3,
+  .y_intercept = 0
+)
+
+```
+
+
+### Customer 3
+
+```{r}
+forecast_full_tbl %>%
+  filter(store == 3) %>% 
+  plot_modeltime_forecast(
+  .facet_ncol = 3,
+  .y_intercept = 0
+)
+
+```
+
+
+Safety Stock {data-icon="fa-cube"}
+========================================================================
+
+```{r}
+lead_time <- 14
+
+calc_sigmadl_tbl <- rmse_models %>% 
+  left_join(biweekly_demand_by_item, by = c("item" = "item")) %>% 
+  select(item, rmse, total_biweekly_forecasted_sales) %>% 
+  mutate(sigmadl = rmse * sqrt(lead_time))
+
+abc_k_servicelvl_tbl <- tribble(
+  ~category, ~service_level,
+  #--|--|----
+  "a", 0.95, # 95% percent of my time to statisfy customer's order 
+  "b", 0.75, # 75% percent of my time to fulfill customer's order 
+  "c", 0.6
+) %>% 
+  mutate(
+    k = qnorm(service_level)
+  )
+
+k_a <-  abc_k_servicelvl_tbl %>% filter(category == "a") %>% pull("k")
+k_b <-  abc_k_servicelvl_tbl %>% filter(category == "b") %>% pull("k")
+k_c <-  abc_k_servicelvl_tbl %>% filter(category == "c") %>% pull("k")
+
+
+#calculate safety stock level and order point
+
+safety_stock_tbl <- calc_sigmadl_tbl %>% 
+  #calculate safety stock based on the abc categories
+  mutate(
+    safety_stock_a = k_a * sigmadl,
+    safety_stock_b = k_b * sigmadl,
+    safety_stock_c = k_c * sigmadl,
+  ) %>% 
+  
+  # calculate min stock allocated 
+  mutate(
+    min_stock_a = total_biweekly_forecasted_sales + safety_stock_a,
+    min_stock_b = total_biweekly_forecasted_sales + safety_stock_b,
+    min_stock_c = total_biweekly_forecasted_sales + safety_stock_c,
+  )
+
+```
+
+Inventory Replenish Cycle {data-width=650, .tabset}
+-----------------------------------------------------------------------
+
+### Item 1
+
+```{r}
+
+inventory_item_1 <- read_csv("data/inventory_replenish_cycle_item_1.csv")%>% 
+  mutate(date = dmy(date))
+
+g_inventory_cycle_1 <- ggplot(data = inventory_item_1, aes(x = date, y=inventory)) +
+  geom_line() +
+  geom_hline(yintercept = safety_stock_tbl %>% filter(item==1) %>% pull(min_stock_a), linetype="dashed", color = "green") +
+  geom_hline(yintercept = safety_stock_tbl %>% filter(item==1) %>% pull(min_stock_b), linetype="dashed", color = "yellow") +
+  geom_hline(yintercept = safety_stock_tbl %>% filter(item==1) %>% pull(min_stock_c), linetype="dashed", color = "red")+
+  geom_text(aes(date("2014-6-12"), round(safety_stock_tbl %>% filter(item==1) %>% pull(min_stock_a)) + 6, 
+                label = paste0("A: ", round(safety_stock_tbl %>% filter(item==1) %>% pull(min_stock_a))), vjust = - 1)) +
+  geom_text(aes(date("2014-6-12"), round(safety_stock_tbl %>% filter(item==1) %>% pull(min_stock_b)) + 6, 
+                label = paste0("B: ", round(safety_stock_tbl %>% filter(item==1) %>% pull(min_stock_b))), vjust = - 1)) +
+  geom_text(aes(date("2014-6-12"), round(safety_stock_tbl %>% filter(item==1) %>% pull(min_stock_c)) + 6, 
+                label = paste0("C: ", round(safety_stock_tbl %>% filter(item==1) %>% pull(min_stock_c))), vjust = - 1))
+
+ggplotly(g_inventory_cycle_1)
+```
+
+
+### Item 2
+
+```{r}
+
+inventory_item_2 <- read_csv("data/inventory_replenish_cycle_item_2.csv")%>% 
+  mutate(date = dmy(date)) %>% 
+  mutate(inventory = inventory+100)
+
+g_inventory_cycle_2 <- ggplot(data = inventory_item_2, aes(x = date, y=inventory)) +
+  geom_line() +
+  geom_hline(yintercept = safety_stock_tbl %>% filter(item==2) %>% pull(min_stock_a), linetype="dashed", color = "green") +
+  geom_hline(yintercept = safety_stock_tbl %>% filter(item==2) %>% pull(min_stock_b), linetype="dashed", color = "yellow") +
+  geom_hline(yintercept = safety_stock_tbl %>% filter(item==2) %>% pull(min_stock_c), linetype="dashed", color = "red")+
+  geom_text(aes(date("2014-6-12"), round(safety_stock_tbl %>% filter(item==2) %>% pull(min_stock_a)) + 6, 
+                label = paste0("A: ", round(safety_stock_tbl %>% filter(item==2) %>% pull(min_stock_a))), vjust = - 1)) +
+  geom_text(aes(date("2014-6-12"), round(safety_stock_tbl %>% filter(item==2) %>% pull(min_stock_b)) + 6, 
+                label = paste0("B: ", round(safety_stock_tbl %>% filter(item==2) %>% pull(min_stock_b))), vjust = - 1)) +
+  geom_text(aes(date("2014-6-12"), round(safety_stock_tbl %>% filter(item==2) %>% pull(min_stock_c)) + 6, 
+                label = paste0("C: ", round(safety_stock_tbl %>% filter(item==2) %>% pull(min_stock_c))), vjust = - 1))
+
+
+ggplotly(g_inventory_cycle_2)
+```
